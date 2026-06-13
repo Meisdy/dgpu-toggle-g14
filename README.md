@@ -84,15 +84,6 @@ sudo dgpu off -y     # skip the reboot confirmation
 `off` and `on` need root (they stop a service, (un)load modules, and write
 sysfs). `status` does not.
 
-## Gaming
-
-In Hybrid, run games on the dGPU with `prime-run`. In Steam, set the launch
-options to:
-
-```
-prime-run %command%
-```
-
 ## Notes
 
 - If you also have `supergfxd` installed, disable it so it does not fight the
