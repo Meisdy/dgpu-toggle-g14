@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# dgpu — switch the ROG G14 (GA401QE) dGPU on/off.
+#
+# The dGPU is ejected from / added to the PCI bus via an ACPI WMI call exposed
+# at /sys/devices/platform/asus-nb-wmi/dgpu_disable (0 = on, 1 = off).
+#
+# off: disabling is refused while the nvidia driver is bound, so we stop
+#      nvidia-powerd, unload the modules, write the flag, then reboot — the
+#      reboot avoids any live-teardown hang.
+# on:  enabling is live — write the flag, rescan the PCI bus to power the card
+#      back up, load the driver. No reboot needed.
+#
+# The flag reads back 1 once the card is re-added, so it is unreliable as a
+# state source; lspci (card present on the bus) is the ground truth.
+#
+# The write goes straight to sysfs, not `asusctl armoury set` — on this
+# machine asusctl reports "Multiple asusd interfaces" and its set silently
+# no-ops, while the sysfs path works.
+
+set -euo pipefail
+
+readonly FLAG="/sys/devices/platform/asus-nb-wmi/dgpu_disable"
+readonly PCI_RESCAN="/sys/bus/pci/rescan"
+readonly NVIDIA_MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
+
+usage() {
+    cat <<'USAGE'
+Usage: dgpu <command> [-y]
+
+Commands:
+  on          Enable dGPU (Hybrid), live — no reboot       [needs root]
+  off         Disable dGPU (Integrated), then reboot        [needs root]
+  status      Show current dGPU state
+
+Options:
+  -y          Skip the reboot confirmation prompt
+USAGE
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "dgpu: '$1' needs root — run: sudo dgpu $1" >&2
+        exit 1
+    fi
+}
+
+# Ground truth: is the dGPU present on the PCI bus? (10de = NVIDIA vendor ID)
+dgpu_present() {
+    lspci -d 10de: | grep -qi .
+}
+
+label_for() {
+    case "$1" in
+        0) echo "on (Hybrid)" ;;
+        1) echo "off (Integrated)" ;;
+    esac
+}
+
+confirm_reboot() {
+    [[ "${1:-}" == "-y" ]] && return 0
+    read -rp "Reboot now to apply? [y/N] " answer
+    [[ "$answer" == [yY] ]]
+}
+
+# Free the dGPU so the ACPI eject is accepted: drop the Dynamic Boost daemon
+# (its open handles are the only thing holding the card when idle) then unload
+# the driver stack. Safe on this Optimus setup — the desktop runs on amdgpu.
+release_nvidia() {
+    systemctl stop nvidia-powerd 2>/dev/null || true
+    modprobe -r "${NVIDIA_MODULES[@]}"
+}
+
+# Used by the off path only. There the flag genuinely reads back 1 and the
+# card leaves the bus, so verifying the flag is correct — and the guard against
+# rebooting on a failed write is the safety net for the live-teardown hang.
+write_flag() {
+    local target="$1" readback
+    echo "$target" > "$FLAG"
+    readback=$(cat "$FLAG")
+    if [[ "$readback" != "$target" ]]; then
+        echo "dgpu: flag did not stick (still $readback); not rebooting" >&2
+        exit 1
+    fi
+}
+
+reboot_if_confirmed() {
+    echo "Staged dGPU $(label_for "$1")."
+    if confirm_reboot "${2:-}"; then
+        systemctl reboot
+    else
+        echo "Not rebooting. Change applies on next boot."
+    fi
+}
+
+turn_off() {
+    require_root off
+    if ! dgpu_present; then
+        echo "dGPU already off (Integrated). Nothing to do."
+        return
+    fi
+    release_nvidia
+    write_flag 1
+    reboot_if_confirmed 1 "${1:-}"
+}
+
+turn_on() {
+    if dgpu_present; then
+        echo "dGPU already on (Hybrid). Nothing to do."
+        return
+    fi
+    require_root on
+    # Enabling is live: clear the flag, then rescan the PCI bus so the card is
+    # re-added and powered. A bare flag write alone leaves the slot ejected.
+    echo 0 > "$FLAG"
+    echo 1 > "$PCI_RESCAN"
+    if ! lspci -d 10de: | grep -qi .; then
+        echo "dgpu: dGPU did not appear on the bus after rescan" >&2
+        exit 1
+    fi
+    modprobe nvidia nvidia_modeset nvidia_uvm nvidia_drm
+    systemctl start nvidia-powerd 2>/dev/null || true
+    echo "dGPU on (Hybrid). No reboot needed — prime-run is available now."
+}
+
+main() {
+    case "${1:-}" in
+        on)      turn_on "${2:-}" ;;
+        off)     turn_off "${2:-}" ;;
+        status)  dgpu_present && echo "dGPU on (Hybrid)" || echo "dGPU off (Integrated)" ;;
+        *)       usage; exit 1 ;;
+    esac
+}
+
+main "$@"
